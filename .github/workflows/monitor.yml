@@ -1,11 +1,32 @@
-name: Test Workflow
+
+name: Wiimmfi Connection Test
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Hello
-        run: echo "GitHub Actions funktioniert!"
+      - name: Test Wiimmfi endpoints
+        run: |
+          python - <<'PY'
+          import requests
+
+          urls = [
+              "https://wiimmfi.de/stats/mkw",
+              "https://wiimmfi.de/stats/mkwx?m=json",
+              "https://wiimmfi.de/stats/game/mariokartwii/text"
+          ]
+
+          for url in urls:
+              try:
+                  r = requests.get(url, timeout=20)
+                  print("\nURL:", url)
+                  print("HTTP:", r.status_code)
+                  print("Antwort:", r.text[:1000])
+              except Exception as e:
+                  print("FEHLER:", url, e)
+          PY
