@@ -1,5 +1,5 @@
 
-name: Wiimmfi Connection Test
+name: Wiimmfi Region Scanner
 
 on:
   workflow_dispatch:
@@ -7,26 +7,43 @@ on:
     - cron: "*/5 * * * *"
 
 jobs:
-  test:
+  scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Test Wiimmfi endpoints
+      - name: Scan Wiimmfi room data
         run: |
           python - <<'PY'
           import requests
+          import json
 
-          urls = [
-              "https://wiimmfi.de/stats/mkw",
-              "https://wiimmfi.de/stats/mkwx?m=json",
-              "https://wiimmfi.de/stats/game/mariokartwii/text"
-          ]
+          url = "https://wiimmfi.de/stats/mkwx?m=json"
 
-          for url in urls:
-              try:
-                  r = requests.get(url, timeout=20)
-                  print("\nURL:", url)
-                  print("HTTP:", r.status_code)
-                  print("Antwort:", r.text[:1000])
-              except Exception as e:
-                  print("FEHLER:", url, e)
+          response = requests.get(url, timeout=30)
+          response.raise_for_status()
+          data = response.json()
+
+          print("JSON erfolgreich geladen")
+          print("Einträge:", len(data))
+
+          for item in data:
+              if not isinstance(item, dict):
+                  continue
+
+              if item.get("type") == "room":
+                  print("\n--- ROOM ---")
+                  print("Room ID:", item.get("room_id"))
+                  print("Room name:", item.get("room_name"))
+                  print("Room region:", item.get("region"))
+                  print("Room keys:", list(item.keys()))
+
+                  for member in item.get("members", []):
+                      print(
+                          "PLAYER:",
+                          "Region:", member.get("region"),
+                          "Keys:", list(member.keys())
+                      )
+
+          print("\n--- Suche nach 20053 ---")
+          raw = json.dumps(data)
+          print("20053 gefunden:", "20053" in raw)
           PY
