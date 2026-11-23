@@ -1,96 +1,41 @@
 
-#!/usr/bin/env python3
-
 import json
 import re
 import time
-from pathlib import Path
-from urllib.parse import urljoin, unquote
+from urllib.parse import unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-BASE = "https://mkwiiki.org"
-INDEX = BASE + "/wiki/Custom_Track_Distribution"
-API = BASE + "/w/api.php"
 
-OUTPUT = Path("hns_packs.json")
-REPORT = Path("hns_catalog_report.txt")
+BASE = "https://mkwiiki.org"
+API = BASE + "/w/api.php"
+INDEX_URL = BASE + "/wiki/Custom_Track_Distribution"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 MKWii-HNS-Catalogue/4.0"
+    "User-Agent": "HNS-Pack-Catalogue/5.0"
 }
 
-HNS_TERMS = [
-    "hns",
-    "hide and seek",
-    "hide & seek",
-    "hide-and-seek",
-    "seek and hide",
-    "hide n seek",
-    "hide/seek"
-]
+session = requests.Session()
+session.headers.update(HEADERS)
 
-EXCLUDED = {
-    "riivolution",
-    "my stuff",
-    "custom track distribution",
-    "edit",
-    "history",
-    "main page",
-    "download"
-}
 
-# Diese Seiten ausdrücklich ergänzen,
-# falls sie in der Übersicht nicht erkannt werden.
 EXTRA_PACKS = {
     "Xenøn's HNS: Horizon":
         BASE + "/wiki/Xen%C3%B8n%27s_HNS%3A_Horizon",
 
     "Xenøn's HNS: Beyond":
-        BASE + "/wiki/Xen%C3%B8n%27s_HNS%3A_Beyond"
+        BASE + "/wiki/Xen%C3%B8n%27s_HNS%3A_Beyond",
 }
 
 
-def clean(value):
-    return re.sub(
-        r"\s+",
-        " ",
-        (value or "")
-    ).strip()
-
-
-def normalize(value):
-    value = clean(value).lower()
-    value = re.sub(r"\([^)]*\)", " ", value)
-    value = re.sub(
-        r"\bv?\d+(?:\.\d+)*(?:[a-z-]+)?\b",
-        " ",
-        value
-    )
-    value = re.sub(r"[^a-z0-9]+", " ", value)
-    return clean(value)
-
-
-def is_hns_name(value):
-    value = (value or "").lower()
-
-    return any(
-        term in value
-        for term in HNS_TERMS
-    )
-
-
 def get(url, params=None):
-    response = requests.get(
+    response = session.get(
         url,
         params=params,
-        headers=HEADERS,
-        timeout=30
+        timeout=40
     )
-
     response.raise_for_status()
-
     return response
 
 
@@ -106,472 +51,401 @@ def wiki_parse(title):
         }
     ).json()
 
+    # Diagnose: tatsächliche API-Fehlermeldung ausgeben
+    if "parse" not in result:
+        print(
+            "\nWIKI API FEHLER:",
+            json.dumps(result, ensure_ascii=False, indent=2)
+        )
+        raise RuntimeError(
+            "Wiki API hat keine parse-Daten geliefert"
+        )
+
     return result["parse"]["text"]
 
 
+def page_title_from_url(url):
+    path = urlparse(url).path
+    title = path.split("/wiki/", 1)[-1]
+    return unquote(title).replace("_", " ")
+
+
 def extract_pack_links():
-    print("Lade Pack-Übersicht ...")
+    print("Lade HNS-Pack-Index ...")
 
-    result = get(
-        API,
-        {
-            "action": "parse",
-            "page": "Custom Track Distribution",
-            "prop": "text",
-            "format": "json",
-            "formatversion": "2"
-        }
-    ).json()
+    html = wiki_parse("Custom Track Distribution")
+    soup = BeautifulSoup(html, "html.parser")
 
-    soup = BeautifulSoup(
-        result["parse"]["text"],
-        "html.parser"
-    )
+    packs = {}
 
-    found = {}
+    for link in soup.find_all("a", href=True):
+        name = link.get_text(" ", strip=True)
+        href = link["href"]
 
-    for link in soup.select("a[href*='/wiki/']"):
-
-        visible_name = clean(
-            link.get_text(" ", strip=True)
-        )
-
-        title_attribute = clean(
-            link.get("title", "")
-        )
-
-        href = link.get("href", "")
-
-        if not href:
+        if not name or not href.startswith("/wiki/"):
             continue
 
-        # Sichtbaren Namen bevorzugen.
-        title = visible_name or title_attribute
+        searchable = name.lower()
 
-        if not title:
+        if (
+            "hns" not in searchable
+            and "hide and seek" not in searchable
+        ):
             continue
 
-        if title.lower() in EXCLUDED:
+        if ":" in href and not href.startswith("/wiki/Xen"):
             continue
 
-        if ":" in title:
-            continue
+        full_url = BASE + href.split("#")[0]
 
-        if not is_hns_name(title):
-            continue
+        packs[name] = full_url
 
-        full_url = urljoin(BASE, href)
+    # Zusätzliche bekannte Pack-Seiten
+    packs.update(EXTRA_PACKS)
 
-        found[title] = full_url
+    print("Gefundene Pack-Seiten:", len(packs))
 
-    # Fehlende bekannte Seiten ergänzen.
-    for name, url in EXTRA_PACKS.items():
-        found[name] = url
-
-    return found
+    return packs
 
 
-def get_declared_count(soup, label):
+def get_declared_counts(soup):
+    text = soup.get_text(" ", strip=True)
 
-    for table in soup.select("table.infobox"):
+    track_count = None
+    arena_count = None
 
-        for row in table.select("tr"):
+    patterns_tracks = [
+        r"(\d+)\s+tracks?",
+        r"tracks?[:\s]+(\d+)",
+    ]
 
-            cells = [
-                clean(cell.get_text(" ", strip=True))
-                for cell in row.select("th, td")
-            ]
+    patterns_arenas = [
+        r"(\d+)\s+arenas?",
+        r"arenas?[:\s]+(\d+)",
+    ]
 
-            if len(cells) < 2:
-                continue
+    for pattern in patterns_tracks:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            track_count = int(match.group(1))
+            break
 
-            if cells[0].lower().rstrip(":") == label.lower():
+    for pattern in patterns_arenas:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            arena_count = int(match.group(1))
+            break
 
-                match = re.search(
-                    r"\d+",
-                    cells[1]
-                )
-
-                if match:
-                    return int(match.group())
-
-    text = clean(
-        soup.get_text(" ", strip=True)
-    )[:10000]
-
-    match = re.search(
-        rf"\b{re.escape(label)}\s*:?\s*(\d+)\b",
-        text,
-        re.IGNORECASE
-    )
-
-    if match:
-        return int(match.group(1))
-
-    return None
+    return track_count, arena_count
 
 
-def expand_table_rows(table):
-    """
-    Berücksichtigt rowspan und colspan.
-    Dadurch bleiben zusammengeführte Cup-
-    und Stage-Zellen an der richtigen Position.
-    """
-
-    active_spans = {}
-    expanded_rows = []
-
-    for row in table.select("tr"):
-
-        current = {}
-
-        # Vorhandene Rowspans übernehmen.
-        for column, data in list(active_spans.items()):
-
-            value, remaining = data
-
-            current[column] = value
-
-            if remaining > 1:
-                active_spans[column] = (
-                    value,
-                    remaining - 1
-                )
-            else:
-                del active_spans[column]
-
-        cells = row.find_all(
-            ["th", "td"],
-            recursive=False
-        )
-
-        column = 0
-
-        for cell in cells:
-
-            while column in current:
-                column += 1
-
-            value = clean(
-                cell.get_text(" ", strip=True)
-            )
-
-            try:
-                colspan = int(
-                    cell.get("colspan", 1)
-                )
-            except ValueError:
-                colspan = 1
-
-            try:
-                rowspan = int(
-                    cell.get("rowspan", 1)
-                )
-            except ValueError:
-                rowspan = 1
-
-            colspan = max(1, colspan)
-            rowspan = max(1, rowspan)
-
-            for offset in range(colspan):
-
-                target = column + offset
-
-                current[target] = value
-
-                if rowspan > 1:
-                    active_spans[target] = (
-                        value,
-                        rowspan - 1
-                    )
-
-            column += colspan
-
-        if current:
-            max_column = max(current.keys())
-
-            expanded = [
-                current.get(i, "")
-                for i in range(max_column + 1)
-            ]
-
-            expanded_rows.append(expanded)
-
-    return expanded_rows
-
-
-def extract_table_items(soup, wanted_column):
-
+def extract_table_items(soup, keyword):
     results = []
 
-    for table in soup.select("table"):
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr", recursive=True)
 
-        rows = expand_table_rows(table)
-
-        header_index = None
-        column_index = None
-
-        # Passende Tabellenüberschrift suchen.
-        for row_index, row in enumerate(rows):
-
-            for index, value in enumerate(row):
-
-                if clean(value).lower().rstrip(":") == wanted_column.lower():
-
-                    header_index = row_index
-                    column_index = index
-                    break
-
-            if header_index is not None:
-                break
-
-        if header_index is None:
+        if not rows:
             continue
 
-        # Werte aus der passenden Spalte sammeln.
-        for row in rows[header_index + 1:]:
+        header_row = None
+        header_cells = []
 
-            if len(row) <= column_index:
+        for row in rows:
+            cells = row.find_all(
+                ["th", "td"],
+                recursive=False
+            )
+
+            if not cells:
                 continue
 
-            value = clean(row[column_index])
+            headers = [
+                cell.get_text(" ", strip=True).lower()
+                for cell in cells
+            ]
 
-            if not value:
+            if any(keyword in h for h in headers):
+                header_row = row
+                header_cells = cells
+                break
+
+        if header_row is None:
+            continue
+
+        column_index = None
+
+        for index, cell in enumerate(header_cells):
+            heading = cell.get_text(" ", strip=True).lower()
+
+            if keyword in heading:
+                column_index = index
+                break
+
+        if column_index is None:
+            continue
+
+        active_spans = {}
+        table_items = []
+
+        for row in rows:
+            if row is header_row:
                 continue
 
-            if value.lower() in {
+            cells = row.find_all(
+                ["th", "td"],
+                recursive=False
+            )
+
+            if not cells:
+                continue
+
+            expanded = []
+            current_index = 0
+
+            for cell in cells:
+                while current_index in active_spans:
+                    expanded.append(active_spans[current_index]["text"])
+                    active_spans[current_index]["remaining"] -= 1
+
+                    if active_spans[current_index]["remaining"] <= 0:
+                        del active_spans[current_index]
+
+                    current_index += 1
+
+                value = cell.get_text(" ", strip=True)
+                colspan = int(cell.get("colspan", 1))
+                rowspan = int(cell.get("rowspan", 1))
+
+                for offset in range(colspan):
+                    expanded.append(value)
+
+                    if rowspan > 1:
+                        active_spans[current_index] = {
+                            "text": value,
+                            "remaining": rowspan - 1
+                        }
+
+                    current_index += 1
+
+            while current_index in active_spans:
+                expanded.append(active_spans[current_index]["text"])
+                active_spans[current_index]["remaining"] -= 1
+
+                if active_spans[current_index]["remaining"] <= 0:
+                    del active_spans[current_index]
+
+                current_index += 1
+
+            if column_index >= len(expanded):
+                continue
+
+            item = expanded[column_index].strip()
+
+            if not item:
+                continue
+
+            if item.lower() in (
                 "track",
+                "tracks",
                 "arena",
-                "version",
-                "author",
-                "music",
+                "arenas",
                 "cup",
-                "stages"
-            }:
+                "stage"
+            ):
                 continue
 
-            if value not in results:
-                results.append(value)
+            if item not in table_items:
+                table_items.append(item)
+
+        if len(table_items) > len(results):
+            results = table_items
 
     return results
 
 
-def extract_pack_page(title, url):
+def extract_pack_page(name, url):
+    print("\nLese:", name)
 
-    print("Lese:", title)
+    title = page_title_from_url(url)
 
-    page_title = unquote(
-        url.split("/wiki/", 1)[1]
-    ).replace("_", " ")
+    html = wiki_parse(title)
+    soup = BeautifulSoup(html, "html.parser")
 
-    html = wiki_parse(page_title)
+    declared_tracks, declared_arenas = get_declared_counts(soup)
 
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
+    tracks = extract_table_items(soup, "track")
+    arenas = extract_table_items(soup, "arena")
 
-    tracks = extract_table_items(
-        soup,
-        "Track"
-    )
-
-    arenas = extract_table_items(
-        soup,
-        "Arena"
-    )
-
-    declared_tracks = get_declared_count(
-        soup,
-        "Tracks"
-    )
-
-    declared_arenas = get_declared_count(
-        soup,
-        "Arenas"
-    )
+    tracks = list(dict.fromkeys(tracks))
+    arenas = list(dict.fromkeys(arenas))
 
     track_count = len(tracks)
     arena_count = len(arenas)
 
-    track_complete = (
-        declared_tracks is not None
-        and track_count == declared_tracks
-    )
-
-    arena_complete = (
-        declared_arenas is None
-        or arena_count == declared_arenas
-    )
-
-    if track_count == 0 and arena_count == 0:
-
-        status = "needs_manual_review"
-
-    elif track_complete and arena_complete:
-
-        status = "complete"
-
+    if declared_tracks is None:
+        status = "manual_check"
+    elif track_count == declared_tracks:
+        if declared_arenas is None or arena_count == declared_arenas:
+            status = "complete"
+        else:
+            status = "partial"
     else:
-
         status = "partial"
 
     return {
-        "name": title,
+        "name": name,
         "url": url,
-
-        "declared_tracks": declared_tracks,
-        "declared_arenas": declared_arenas,
-
-        "tracks": tracks,
-        "arenas": arenas,
-
+        "declared_track_count": declared_tracks,
         "track_count_extracted": track_count,
+        "tracks": tracks,
+        "declared_arena_count": declared_arenas,
         "arena_count_extracted": arena_count,
-
-        "track_complete": track_complete,
-        "arena_complete": arena_complete,
-
+        "arenas": arenas,
         "status": status
     }
 
 
 def main():
+    packs = extract_pack_links()
 
-    print("================================")
-    print("MKWII HNS CATALOGUE VERSION 4")
-    print("================================")
-
-    pack_links = extract_pack_links()
-
-    print(
-        "Gefundene Pack-Seiten:",
-        len(pack_links)
-    )
-
-    catalogue = {
-        "source": INDEX,
-
-        "generated_utc": time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ",
-            time.gmtime()
-        ),
-
-        "version": 4,
-
-        "packs": []
-    }
-
-    report = []
-
-    errors = 0
-    complete = 0
-    partial = 0
-    manual = 0
+    results = []
+    errors = []
 
     for name, url in sorted(
-        pack_links.items(),
+        packs.items(),
         key=lambda item: item[0].lower()
     ):
-
         try:
+            result = extract_pack_page(name, url)
+            results.append(result)
 
-            pack = extract_pack_page(
-                name,
-                url
-            )
-
-            catalogue["packs"].append(pack)
-
-            if pack["status"] == "complete":
-                complete += 1
-
-            elif pack["status"] == "partial":
-                partial += 1
-
-            else:
-                manual += 1
-
-            track_expected = (
-                str(pack["declared_tracks"])
-                if pack["declared_tracks"] is not None
-                else "?"
-            )
-
-            arena_expected = (
-                str(pack["declared_arenas"])
-                if pack["declared_arenas"] is not None
-                else "?"
-            )
-
-            report.append(
-                f"{name}\n"
-                f"  Strecken: "
-                f"{pack['track_count_extracted']}"
-                f"/{track_expected}\n"
-                f"  Arenen: "
-                f"{pack['arena_count_extracted']}"
-                f"/{arena_expected}\n"
-                f"  Status: {pack['status']}\n"
+            print(
+                "  Strecken:",
+                result["track_count_extracted"],
+                "/",
+                result["declared_track_count"],
+                "| Arenen:",
+                result["arena_count_extracted"],
+                "/",
+                result["declared_arena_count"],
+                "|",
+                result["status"]
             )
 
         except Exception as error:
+            message = str(error)
 
-            errors += 1
+            print("  FEHLER:", message)
 
-            catalogue["packs"].append({
+            errors.append({
                 "name": name,
                 "url": url,
-
-                "tracks": [],
-                "arenas": [],
-
-                "track_count_extracted": 0,
-                "arena_count_extracted": 0,
-
-                "status": "fetch_failed",
-
-                "error": str(error)[:300]
+                "error": message
             })
 
-            report.append(
-                f"{name}\n"
-                f"  FEHLER: {error}\n"
-            )
+        time.sleep(0.3)
 
-        time.sleep(0.35)
+    complete = sum(
+        1 for p in results
+        if p["status"] == "complete"
+    )
 
-    OUTPUT.write_text(
-        json.dumps(
-            catalogue,
+    partial = sum(
+        1 for p in results
+        if p["status"] == "partial"
+    )
+
+    manual = sum(
+        1 for p in results
+        if p["status"] == "manual_check"
+    )
+
+    report = []
+
+    report.append("HNS PACK KATALOG – VERSION 5")
+    report.append("=" * 50)
+    report.append("")
+    report.append(f"Pack-Seiten: {len(packs)}")
+    report.append(f"Vollständig: {complete}")
+    report.append(f"Unvollständig: {partial}")
+    report.append(f"Manuelle Prüfung: {manual}")
+    report.append(f"Fehler: {len(errors)}")
+    report.append("")
+
+    for pack in results:
+        report.append("-" * 50)
+        report.append(pack["name"])
+        report.append("URL: " + pack["url"])
+
+        report.append(
+            "Strecken: "
+            + str(pack["track_count_extracted"])
+            + " / "
+            + str(pack["declared_track_count"])
+        )
+
+        report.append(
+            "Arenen: "
+            + str(pack["arena_count_extracted"])
+            + " / "
+            + str(pack["declared_arena_count"])
+        )
+
+        report.append("Status: " + pack["status"])
+        report.append("")
+
+        report.append("STRECKEN:")
+        for track in pack["tracks"]:
+            report.append(" - " + track)
+
+        report.append("")
+        report.append("ARENEN:")
+        for arena in pack["arenas"]:
+            report.append(" - " + arena)
+
+        report.append("")
+
+    if errors:
+        report.append("=" * 50)
+        report.append("FEHLER")
+        report.append("=" * 50)
+
+        for error in errors:
+            report.append(error["name"])
+            report.append(error["error"])
+            report.append(error["url"])
+            report.append("")
+
+    with open(
+        "hns_packs.json",
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(
+            {
+                "version": 5,
+                "packs": results,
+                "errors": errors
+            },
+            file,
             ensure_ascii=False,
             indent=2
-        ) + "\n",
-        encoding="utf-8"
-    )
+        )
 
-    REPORT.write_text(
-        "MKWII HNS PACK-KATALOG VERSION 4\n"
-        f"Quelle: {INDEX}\n"
-        f"Pack-Seiten: {len(pack_links)}\n"
-        f"Vollständig: {complete}\n"
-        f"Unvollständig: {partial}\n"
-        f"Manuelle Prüfung: {manual}\n"
-        f"Fehler: {errors}\n\n"
-        + "\n".join(report),
+    with open(
+        "hns_catalog_report.txt",
+        "w",
         encoding="utf-8"
-    )
+    ) as file:
+        file.write("\n".join(report))
 
-    print("--------------------------------")
-    print("FERTIG!")
-    print("Packs:", len(catalogue["packs"]))
+    print("\n===== HNS KATALOG FERTIG =====")
+    print("Pack-Seiten:", len(packs))
     print("Vollständig:", complete)
     print("Unvollständig:", partial)
     print("Manuelle Prüfung:", manual)
-    print("Fehler:", errors)
-    print("Datenbank:", OUTPUT)
-    print("Bericht:", REPORT)
-    print("--------------------------------")
+    print("Fehler:", len(errors))
 
 
 if __name__ == "__main__":
