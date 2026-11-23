@@ -35,7 +35,7 @@ jobs:
           response.raise_for_status()
           data = response.json()
 
-          # HNS-Räume anhand der Spieler-Region 20053 erkennen
+          # HNS-Räume erkennen
           current_rooms = {}
 
           for item in data:
@@ -53,6 +53,36 @@ jobs:
                   current_rooms[room_id] = item.get("room_name", "HNS-Raum")
 
           print("Gefundene HNS-Räume:", current_rooms)
+
+          # Diagnose: Zusatzinformationen der HNS-Räume
+          for item in data:
+              if not isinstance(item, dict):
+                  continue
+
+              if item.get("type") != "room":
+                  continue
+
+              room_id = str(item.get("room_id", "unknown"))
+
+              if room_id in current_rooms:
+                  print("=== HNS PACK DIAGNOSE ===")
+                  print("Room ID:", room_id)
+                  print("Raumname:", item.get("room_name"))
+                  print("Raum-Felder:", list(item.keys()))
+
+                  for member in item.get("members", []):
+                      if isinstance(member, dict):
+                          print("--- SPIELER ---")
+                          for field in [
+                              "region",
+                              "patcher_info",
+                              "ctgp_flags",
+                              "ctgp_proom",
+                              "track"
+                          ]:
+                              print(field + ":", member.get(field))
+
+                          print("Spieler-Felder:", list(member.keys()))
 
           # Bisher gemeldete Räume aus GitHub laden
           repo = os.environ["GITHUB_REPOSITORY"]
