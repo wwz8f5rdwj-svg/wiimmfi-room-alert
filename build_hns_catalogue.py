@@ -18,7 +18,7 @@ OUTPUT = Path("hns_packs.json")
 REPORT = Path("hns_catalog_report.txt")
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 MKWii-HNS-Catalogue/2.0"
+    "User-Agent": "Mozilla/5.0 MKWii-HNS-Catalogue/3.0"
 }
 
 HNS_TERMS = [
@@ -106,8 +106,6 @@ def extract_pack_links():
 
     found = {}
 
-    # Nur Links übernehmen, deren eigener Name
-    # auf ein Hide-and-Seek-Pack hinweist.
     for link in soup.select("a[href*='/wiki/']"):
 
         title = clean(
@@ -137,7 +135,6 @@ def extract_pack_links():
 
 
 def get_declared_count(soup, label):
-    # Sucht die angegebene Gesamtzahl im Infokasten.
     for table in soup.select("table.infobox"):
         for row in table.select("tr"):
             cells = [
@@ -152,7 +149,6 @@ def get_declared_count(soup, label):
                     if match:
                         return int(match.group())
 
-    # Zusätzliche Suche im Seitenanfang.
     text = clean(soup.get_text(" ", strip=True))[:5000]
 
     match = re.search(
@@ -170,13 +166,13 @@ def get_declared_count(soup, label):
 def extract_table_items(soup, wanted_column):
     results = []
 
-    for table in soup.select("table.wikitable"):
-
+    # KORREKTUR: Alle Tabellen durchsuchen,
+    # nicht nur Tabellen mit der Klasse "wikitable".
+    for table in soup.select("table"):
         rows = table.select("tr")
         header_index = None
         column_index = None
 
-        # Richtige Spalte anhand der Tabellenüberschrift finden.
         for row_index, row in enumerate(rows):
 
             cells = row.select("th, td")
@@ -198,7 +194,6 @@ def extract_table_items(soup, wanted_column):
         if header_index is None:
             continue
 
-        # Nur die tatsächliche Track- bzw. Arena-Spalte lesen.
         for row in rows[header_index + 1:]:
 
             cells = row.select("th, td")
@@ -261,7 +256,7 @@ def extract_pack_page(title, url):
 
 def main():
     print("================================")
-    print("MKWII HNS CATALOGUE VERSION 2")
+    print("MKWII HNS CATALOGUE VERSION 3")
     print("================================")
 
     pack_links = extract_pack_links()
@@ -274,7 +269,7 @@ def main():
             "%Y-%m-%dT%H:%M:%SZ",
             time.gmtime()
         ),
-        "version": 2,
+        "version": 3,
         "packs": []
     }
 
@@ -352,7 +347,7 @@ def main():
     )
 
     REPORT.write_text(
-        "MKWII HNS PACK-KATALOG VERSION 2\n"
+        "MKWII HNS PACK-KATALOG VERSION 3\n"
         f"Quelle: {INDEX}\n"
         f"Pack-Seiten: {len(pack_links)}\n"
         f"Fehler: {errors}\n\n"
