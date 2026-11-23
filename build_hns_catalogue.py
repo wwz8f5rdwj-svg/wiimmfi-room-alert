@@ -2,20 +2,21 @@
 import json
 import re
 import time
-from urllib.parse import unquote, urlparse
+import unicodedata
+from urllib.parse import unquote, urlparse, quote
 
 import requests
 from bs4 import BeautifulSoup
 
 
-VERSION = 6
+VERSION = 7
 
 BASE = "https://mkwiiki.org"
 API = BASE + "/w/api.php"
 INDEX_URL = BASE + "/wiki/Custom_Track_Distribution"
 
 HEADERS = {
-    "User-Agent": "HNS-Pack-Catalogue/6.0"
+    "User-Agent": "HNS-Pack-Catalogue/7.0"
 }
 
 session = requests.Session()
@@ -24,11 +25,14 @@ session.headers.update(HEADERS)
 EXTRA_PACKS = {
     "Xenøn's HNS: Horizon":
         BASE + "/wiki/Xen%C3%B8n%27s_HNS%3A_Horizon",
-
     "Xenøn's HNS: Beyond":
         BASE + "/wiki/Xen%C3%B8n%27s_HNS%3A_Beyond",
 }
 
+
+# --------------------------------------------------
+# GRUNDLAGEN
+# --------------------------------------------------
 
 def get(url, params=None):
     response = session.get(
@@ -40,11 +44,41 @@ def get(url, params=None):
     return response
 
 
+def clean_text(value):
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\[[0-9]+\]", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" \t\r\n|")
+
+
+def normalize(value):
+    value = clean_text(value).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(
+        char for char in value
+        if not unicodedata.combining(char)
+    )
+    value = value.replace("_", " ")
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
 def page_title_from_url(url):
     path = urlparse(url).path
     title = path.split("/wiki/", 1)[-1]
     return unquote(title).replace("_", " ")
 
+
+def page_key(value):
+    value = normalize(value)
+    value = value.replace("'", "")
+    value = re.sub(r"[^a-z0-9 ]", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+# --------------------------------------------------
+# WIKI API
+# --------------------------------------------------
 
 def wiki_parse(title):
     result = get(
@@ -61,7 +95,10 @@ def wiki_parse(title):
     if "parse" not in result:
         raise RuntimeError(
             "Wiki API: " +
-            json.dumps(result, ensure_ascii=False)[:1200]
+            json.dumps(
+                result,
+                ensure_ascii=False
+            )[:1200]
         )
 
     return result["parse"]["text"]
@@ -118,6 +155,7 @@ def extract_pack_links():
     )
 
     packs = {}
+    seen_titles = set()
 
     ignored_namespaces = (
         "category:",
@@ -131,7 +169,10 @@ def extract_pack_links():
     )
 
     for link in soup.find_all("a", href=True):
-        name = link.get_text(" ", strip=True)
+        name = clean_text(
+            link.get_text(" ", strip=True)
+        )
+
         href = link["href"].split("#")[0]
 
         if not name or not href.startswith("/wiki/"):
@@ -152,9 +193,24 @@ def extract_pack_links():
         ):
             continue
 
+        key = page_key(title)
+
+        if key in seen_titles:
+            continue
+
+        seen_titles.add(key)
         packs[name] = BASE + href
 
-    packs.update(EXTRA_PACKS)
+    # Zusatzseiten nur hinzufügen, wenn sie nicht
+    # bereits über den Index gefunden wurden.
+    for name, url in EXTRA_PACKS.items():
+        key = page_key(
+            page_title_from_url(url)
+        )
+
+        if key not in seen_titles:
+            packs[name] = url
+            seen_titles.add(key)
 
     print("Gefundene Pack-Seiten:", len(packs))
     print("Index-Quelle:", source)
@@ -163,34 +219,93 @@ def extract_pack_links():
 
 
 # --------------------------------------------------
-# TEXT-BEREINIGUNG
+# FILTER FÜR TABELLENZELLEN
 # --------------------------------------------------
 
-def clean_text(value):
-    value = value.replace("\xa0", " ")
-    value = re.sub(r"\s+", " ", value)
-    return value.strip()
+GENERIC_CELLS = {
+    "",
+    "#",
+    "-",
+    "—",
+    "–",
+    "track",
+    "tracks",
+    "track name",
+    "track listing",
+    "track list",
+    "arena",
+    "arenas",
+    "arena name",
+    "arena listing",
+    "arena list",
+    "name",
+    "author",
+    "version",
+    "date",
+    "download",
+    "cup",
+    "stage",
+    "type",
+    "information",
+    "first release",
+    "track count",
+    "number of tracks",
+    "arena count",
+    "number of arenas"
+}
 
 
-def normalize(value):
-    value = clean_text(value)
-    return value.lower().replace("_", " ")
+def is_noise(value):
+    value = normalize(value)
+
+    if value in GENERIC_CELLS:
+        return True
+
+    # Reine Versionsnummern und Dateiendungen
+    if re.fullmatch(
+        r"(?:v|version\s*)?\d+(?:\.\d+)*(?:[-+][a-z0-9._-]+)?(?:\.(?:scp|mkd|hns|ikw|ctgp|opt|item|lctp|ytpdx|mko2|briz|night))?",
+        value,
+        re.IGNORECASE
+    ):
+        return True
+
+    # Reine Beta-, Alpha- und RC-Bezeichnungen
+    if re.fullmatch(
+        r"(?:beta|alpha|rc)(?:[\s._-]*[a-z0-9]+)*",
+        value,
+        re.IGNORECASE
+    ):
+        return True
+
+    # Versionsangaben mit Zusatztext
+    if re.fullmatch(
+        r"(?:pre[- ]?\d+(?:\.\d+)*|v\d+(?:\.\d+)*\s+[\w.-]+)",
+        value,
+        re.IGNORECASE
+    ):
+        return True
+
+    # Platzhalter und reine Dateinamen
+    if re.fullmatch(
+        r"[\w.-]+\.(?:scp|mkd|hns|ikw|opt|item|ctgp|lctp)",
+        value,
+        re.IGNORECASE
+    ):
+        return True
+
+    return False
 
 
-def is_generic_cell(value):
+def is_generic_header(value):
     value = normalize(value)
 
     return value in {
-        "",
-        "#",
         "track",
         "tracks",
         "track name",
-        "track listing",
         "arena",
         "arenas",
         "arena name",
-        "arena listing",
         "name",
         "author",
         "version",
@@ -199,13 +314,12 @@ def is_generic_cell(value):
         "cup",
         "stage",
         "type",
-        "information",
-        "first release"
+        "information"
     }
 
 
 # --------------------------------------------------
-# TABELLEN-HILFSFUNKTIONEN
+# TABELLEN-STRUKTUR
 # --------------------------------------------------
 
 def direct_table_rows(table):
@@ -237,7 +351,10 @@ def preceding_section_heading(table):
 
 
 def table_caption(table):
-    caption = table.find("caption", recursive=False)
+    caption = table.find(
+        "caption",
+        recursive=False
+    )
 
     if caption:
         return normalize(
@@ -256,35 +373,47 @@ def get_table_headers(table):
         if not cells:
             continue
 
-        if not row.find_all("th", recursive=False):
+        th_cells = row.find_all(
+            "th",
+            recursive=False
+        )
+
+        if not th_cells:
             continue
 
-        return [
+        values = [
             normalize(
                 cell.get_text(" ", strip=True)
             )
             for cell in cells
         ]
 
+        if len(th_cells) >= 2:
+            return values
+
+        if all(
+            cell.name == "th"
+            for cell in cells
+        ):
+            return values
+
     return []
 
 
 def find_target_column(headers, keyword):
+    exact = (
+        ("track", "tracks", "track name", "course", "course name", "name")
+        if keyword == "track"
+        else ("arena", "arenas", "arena name", "battle stage", "name")
+    )
+
     for index, heading in enumerate(headers):
+        if heading in exact:
+            return index
 
-        if keyword == "track":
-            if (
-                heading in ("track", "tracks", "track name")
-                or heading.startswith("track ")
-            ):
-                return index
-
-        if keyword == "arena":
-            if (
-                heading in ("arena", "arenas", "arena name")
-                or heading.startswith("arena ")
-            ):
-                return index
+    for index, heading in enumerate(headers):
+        if keyword in heading:
+            return index
 
     return None
 
@@ -293,34 +422,75 @@ def section_matches(text, keyword):
     text = normalize(text)
 
     if keyword == "track":
-        return any(
-            word in text
-            for word in (
-                "track listing",
-                "track list",
-                "tracks",
-                "custom tracks",
-                "track"
-            )
+        terms = (
+            "track listing",
+            "track list",
+            "tracks",
+            "custom tracks",
+            "track"
+        )
+    else:
+        terms = (
+            "arena listing",
+            "arena list",
+            "arenas",
+            "arena"
         )
 
-    if keyword == "arena":
-        return any(
-            word in text
-            for word in (
-                "arena listing",
-                "arena list",
-                "arenas",
-                "arena"
-            )
-        )
-
-    return False
+    return any(
+        term in text
+        for term in terms
+    )
 
 
 # --------------------------------------------------
-# TABELLEN-INHALT AUSLESEN
+# ZELLEN AUSLESEN
 # --------------------------------------------------
+
+def cell_candidates(cell):
+    candidates = []
+
+    # Verlinkte Namen zuerst prüfen.
+    for link in cell.find_all("a"):
+        value = clean_text(
+            link.get_text(" ", strip=True)
+        )
+
+        if value and not is_noise(value):
+            candidates.append(value)
+
+    # Falls keine brauchbaren Links vorhanden sind,
+    # den gesamten Zellinhalt verwenden.
+    full_value = clean_text(
+        cell.get_text(" ", strip=True)
+    )
+
+    if full_value and not is_noise(full_value):
+        candidates.append(full_value)
+
+    return list(dict.fromkeys(candidates))
+
+
+def candidate_score(value, cell):
+    score = 0
+
+    if cell.find("a"):
+        score += 4
+
+    if " " in value:
+        score += 2
+
+    if len(value) >= 8:
+        score += 2
+
+    if len(value) < 3:
+        score -= 5
+
+    if is_noise(value):
+        score -= 100
+
+    return score
+
 
 def extract_rows_from_table(
     table,
@@ -339,14 +509,11 @@ def extract_rows_from_table(
         keyword
     )
 
-    if column_index is None:
-        if not section_matches(
-            section_text,
-            keyword
-        ):
-            return []
-
-        column_index = 0
+    if (
+        column_index is None
+        and not section_matches(section_text, keyword)
+    ):
+        return []
 
     results = []
 
@@ -356,57 +523,82 @@ def extract_rows_from_table(
         if not cells:
             continue
 
-        if row.find_all("th", recursive=False):
-            continue
-
-        if column_index >= len(cells):
-            continue
-
-        cell = cells[column_index]
-
-        if cell.find("table"):
-            continue
-
-        value = clean_text(
-            cell.get_text(" ", strip=True)
-        )
-
-        if is_generic_cell(value):
-            continue
-
-        if re.fullmatch(
-            r"(v|version\s*)?\d+(\.\d+)*([a-z-]+)?",
-            value,
-            re.IGNORECASE
+        # Echte Kopfzeilen überspringen.
+        if all(
+            cell.name == "th"
+            for cell in cells
         ):
             continue
 
-        if len(value) > 160:
+        if column_index is not None:
+            if column_index >= len(cells):
+                continue
+
+            target_cells = [cells[column_index]]
+
+        else:
+            # Ohne eindeutige Spaltenüberschrift alle
+            # Zellen bewerten und den besten Namen nehmen.
+            target_cells = [
+                cell
+                for cell in cells
+                if cell.name == "td"
+            ]
+
+        row_candidates = []
+
+        for cell in target_cells:
+            if cell.find("table"):
+                continue
+
+            for value in cell_candidates(cell):
+                row_candidates.append(
+                    (
+                        candidate_score(value, cell),
+                        value
+                    )
+                )
+
+        if not row_candidates:
             continue
 
-        if value not in results:
-            results.append(value)
+        row_candidates.sort(
+            key=lambda item: item[0],
+            reverse=True
+        )
 
-    return results
+        best_value = row_candidates[0][1]
 
+        if not is_noise(best_value):
+            results.append(best_value)
+
+    return list(dict.fromkeys(results))
+
+
+# --------------------------------------------------
+# MEHRERE PASSENDE TABELLEN SAMMELN
+# --------------------------------------------------
 
 def extract_table_items(soup, keyword):
     candidates = []
 
     for table in soup.find_all("table"):
-
         section = preceding_section_heading(table)
         caption = table_caption(table)
         headers = get_table_headers(table)
 
+        section_text = section + " " + caption
+
         section_match = section_matches(
-            section + " " + caption,
+            section_text,
             keyword
         )
 
         column_match = (
-            find_target_column(headers, keyword)
-            is not None
+            find_target_column(
+                headers,
+                keyword
+            ) is not None
         )
 
         if not section_match and not column_match:
@@ -415,7 +607,7 @@ def extract_table_items(soup, keyword):
         items = extract_rows_from_table(
             table,
             keyword,
-            section + " " + caption
+            section_text
         )
 
         if not items:
@@ -424,7 +616,7 @@ def extract_table_items(soup, keyword):
         score = 0
 
         if section_match:
-            score += 3
+            score += 5
 
         if column_match:
             score += 4
@@ -444,30 +636,34 @@ def extract_table_items(soup, keyword):
     if not candidates:
         return [], False
 
+    # Alle passenden Tabellen berücksichtigen,
+    # nicht nur die Tabelle mit dem höchsten Score.
     candidates.sort(
-        key=lambda item: (
-            item["score"],
-            len(item["items"])
-        ),
+        key=lambda item: item["score"],
         reverse=True
     )
 
-    best = candidates[0]
+    results = []
+
+    for candidate in candidates:
+        for item in candidate["items"]:
+            if item not in results:
+                results.append(item)
 
     print(
-        "  Tabelle:",
+        "  Tabellen:",
         keyword,
-        "| Abschnitt:",
-        best["section"],
+        "| Kandidaten:",
+        len(candidates),
         "| Einträge:",
-        len(best["items"])
+        len(results)
     )
 
-    return best["items"], True
+    return results, True
 
 
 # --------------------------------------------------
-# DEKLARIERTE ANZAHLEN
+# ANGEGEBENE ANZAHLEN
 # --------------------------------------------------
 
 def get_declared_counts(soup):
@@ -475,7 +671,6 @@ def get_declared_counts(soup):
     arena_count = None
 
     for table in soup.find_all("table"):
-
         for row in direct_table_rows(table):
             cells = direct_cells(row)
 
@@ -518,7 +713,7 @@ def get_declared_counts(soup):
 
 
 # --------------------------------------------------
-# PACK-SEITE
+# EINZELNE PACK-SEITE
 # --------------------------------------------------
 
 def extract_pack_page(name, url):
@@ -550,33 +745,39 @@ def extract_pack_page(name, url):
         "arena"
     )
 
-    tracks = list(dict.fromkeys(tracks))
-    arenas = list(dict.fromkeys(arenas))
+    tracks = [
+        item
+        for item in dict.fromkeys(tracks)
+        if not is_noise(item)
+    ]
+
+    arenas = [
+        item
+        for item in dict.fromkeys(arenas)
+        if not is_noise(item)
+    ]
 
     track_count = len(tracks)
     arena_count = len(arenas)
 
+    # Ohne Sollzahlen kann keine vollständige
+    # Erkennung bestätigt werden.
     if not track_table_found or track_count == 0:
         status = "manual_check"
 
-    elif (
-        declared_tracks is not None
-        and track_count != declared_tracks
-    ):
+    elif declared_tracks is None:
         status = "partial"
 
-    elif (
-        declared_arenas is not None
-        and arena_table_found
-        and arena_count != declared_arenas
-    ):
+    elif track_count != declared_tracks:
         status = "partial"
 
-    elif (
-        declared_arenas is not None
-        and declared_arenas > 0
-        and not arena_table_found
-    ):
+    elif declared_arenas is None:
+        status = "partial"
+
+    elif arena_count != declared_arenas:
+        status = "partial"
+
+    elif declared_arenas > 0 and not arena_table_found:
         status = "partial"
 
     else:
@@ -615,7 +816,6 @@ def main():
         packs.items(),
         key=lambda item: item[0].lower()
     ):
-
         try:
             result = extract_pack_page(
                 name,
@@ -684,7 +884,6 @@ def main():
     report.append("")
 
     for pack in results:
-
         report.append("-" * 55)
         report.append(pack["name"])
         report.append("URL: " + pack["url"])
@@ -716,7 +915,6 @@ def main():
 
         report.append("Status: " + pack["status"])
         report.append("")
-
         report.append("STRECKEN:")
 
         for track in pack["tracks"]:
@@ -731,7 +929,6 @@ def main():
         report.append("")
 
     if errors:
-
         report.append("=" * 55)
         report.append("FEHLER")
         report.append("=" * 55)
@@ -747,7 +944,6 @@ def main():
         "w",
         encoding="utf-8"
     ) as file:
-
         json.dump(
             {
                 "version": VERSION,
@@ -764,7 +960,6 @@ def main():
         "w",
         encoding="utf-8"
     ) as file:
-
         file.write(
             "\n".join(report)
         )
