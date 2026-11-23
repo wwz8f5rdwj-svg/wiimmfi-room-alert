@@ -54,7 +54,7 @@ jobs:
 
           print("Gefundene HNS-Räume:", current_rooms)
 
-          # Diagnose: Zusatzinformationen der HNS-Räume
+          # Erweiterte HNS-Pack-Diagnose
           for item in data:
               if not isinstance(item, dict):
                   continue
@@ -68,21 +68,38 @@ jobs:
                   print("=== HNS PACK DIAGNOSE ===")
                   print("Room ID:", room_id)
                   print("Raumname:", item.get("room_name"))
-                  print("Raum-Felder:", list(item.keys()))
+
+                  for field in [
+                      "game_id4",
+                      "race_mode",
+                      "race_phase",
+                      "region",
+                      "track",
+                      "n_races",
+                      "n_members",
+                      "n_players"
+                  ]:
+                      print("RAUM", field, ":", item.get(field))
 
                   for member in item.get("members", []):
                       if isinstance(member, dict):
                           print("--- SPIELER ---")
+
                           for field in [
                               "region",
-                              "patcher_info",
+                              "track",
+                              "flags_local",
+                              "flags_connect",
+                              "flags_nn_con",
+                              "flags_nn_ack",
+                              "flags_nn_suc",
+                              "flags_client",
+                              "ctgp_outdated",
                               "ctgp_flags",
                               "ctgp_proom",
-                              "track"
+                              "patcher_info"
                           ]:
-                              print(field + ":", member.get(field))
-
-                          print("Spieler-Felder:", list(member.keys()))
+                              print("SPIELER", field, ":", member.get(field))
 
           # Bisher gemeldete Räume aus GitHub laden
           repo = os.environ["GITHUB_REPOSITORY"]
