@@ -18,7 +18,7 @@ OUTPUT = Path("hns_packs.json")
 REPORT = Path("hns_catalog_report.txt")
 
 HEADERS = {
-    "User-Agent": "MKWii-HNS-Pack-Scanner/1.0"
+    "User-Agent": "Mozilla/5.0 MKWii-HNS-Catalogue/2.0"
 }
 
 HNS_TERMS = [
@@ -31,17 +31,32 @@ HNS_TERMS = [
     "hide/seek"
 ]
 
+EXCLUDED = {
+    "riivolution",
+    "my stuff",
+    "custom track distribution",
+    "edit",
+    "history",
+    "main page",
+    "download"
+}
 
-def clean(text):
-    return re.sub(r"\s+", " ", (text or "")).strip()
+
+def clean(value):
+    return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def normalize(text):
-    text = clean(text).lower()
-    text = re.sub(r"\([^)]*\)", " ", text)
-    text = re.sub(r"\bv?\d+(?:\.\d+)*(?:[a-z-]+)?\b", " ", text)
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return clean(text)
+def normalize(value):
+    value = clean(value).lower()
+    value = re.sub(r"\([^)]*\)", " ", value)
+    value = re.sub(r"\bv?\d+(?:\.\d+)*(?:[a-z-]+)?\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return clean(value)
+
+
+def is_hns_name(value):
+    value = (value or "").lower()
+    return any(term in value for term in HNS_TERMS)
 
 
 def get(url, params=None):
@@ -55,146 +70,203 @@ def get(url, params=None):
     return response
 
 
-def get_index_html():
-    try:
-        result = get(API, {
+def wiki_parse(title):
+    result = get(
+        API,
+        {
+            "action": "parse",
+            "page": title,
+            "prop": "text",
+            "format": "json",
+            "formatversion": "2"
+        }
+    ).json()
+
+    return result["parse"]["text"]
+
+
+def extract_pack_links():
+    print("Lade Pack-Übersicht ...")
+
+    result = get(
+        API,
+        {
             "action": "parse",
             "page": "Custom Track Distribution",
             "prop": "text",
             "format": "json",
             "formatversion": "2"
-        }).json()
+        }
+    ).json()
 
-        return result["parse"]["text"]
-
-    except Exception as error:
-        print("MediaWiki API nicht verfügbar:", error)
-        print("Versuche direkten Seitenabruf ...")
-        return get(INDEX).text
-
-
-def extract_pack_links():
-    html = get_index_html()
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(
+        result["parse"]["text"],
+        "html.parser"
+    )
 
     found = {}
 
-    for row in soup.select("tr"):
-        row_text = clean(row.get_text(" ", strip=True)).lower()
+    # Nur Links übernehmen, deren eigener Name
+    # auf ein Hide-and-Seek-Pack hinweist.
+    for link in soup.select("a[href*='/wiki/']"):
 
-        if not any(term in row_text for term in HNS_TERMS):
-            continue
-
-        for link in row.select("a[href]"):
-            href = link.get("href", "")
-            title = clean(
-                link.get("title") or link.get_text(" ", strip=True)
-            )
-
-            if not title or not href:
-                continue
-
-            if "/wiki/" not in href:
-                continue
-
-            if title.lower() in ["edit", "history"]:
-                continue
-
-            if ":" in title:
-                continue
-
-            found[title] = urljoin(BASE, href)
-            break
-
-    for link in soup.select("a[href]"):
-        href = link.get("href", "")
         title = clean(
-            link.get("title") or link.get_text(" ", strip=True)
+            link.get("title")
+            or link.get_text(" ", strip=True)
         )
 
-        if not title or "/wiki/" not in href:
+        href = link.get("href", "")
+
+        if not title or not href:
             continue
 
-        if any(term in title.lower() for term in HNS_TERMS):
-            if ":" not in title:
-                found[title] = urljoin(BASE, href)
+        if title.lower() in EXCLUDED:
+            continue
+
+        if ":" in title:
+            continue
+
+        if not is_hns_name(title):
+            continue
+
+        full_url = urljoin(BASE, href)
+
+        found[title] = full_url
 
     return found
 
 
-def get_page_html(title):
-    result = get(API, {
-        "action": "parse",
-        "page": title,
-        "prop": "text",
-        "format": "json",
-        "formatversion": "2"
-    }).json()
-
-    return result["parse"]["text"]
-
-
-def extract_tracks(html):
-    soup = BeautifulSoup(html, "html.parser")
-    tracks = []
-
-    for table in soup.select("table.wikitable"):
+def get_declared_count(soup, label):
+    # Sucht die angegebene Gesamtzahl im Infokasten.
+    for table in soup.select("table.infobox"):
         for row in table.select("tr"):
             cells = [
                 clean(cell.get_text(" ", strip=True))
                 for cell in row.select("th, td")
             ]
 
-            if len(cells) < 2:
-                continue
+            if len(cells) >= 2:
+                if cells[0].lower().rstrip(":") == label.lower():
+                    match = re.search(r"\d+", cells[1])
 
-            candidates = cells[1:]
+                    if match:
+                        return int(match.group())
 
-            for candidate in candidates:
-                lower = candidate.lower()
+    # Zusätzliche Suche im Seitenanfang.
+    text = clean(soup.get_text(" ", strip=True))[:5000]
 
-                if not candidate or len(candidate) < 3:
-                    continue
+    match = re.search(
+        rf"\b{re.escape(label)}\s*:?\s*(\d+)\b",
+        text,
+        re.IGNORECASE
+    )
 
-                if lower in [
-                    "track",
-                    "arena",
-                    "author",
-                    "music",
-                    "version",
-                    "slot",
-                    "cup"
-                ]:
-                    continue
+    if match:
+        return int(match.group(1))
 
-                if any(word in lower for word in [
-                    "track listing",
-                    "download",
-                    "credits",
-                    "overview"
-                ]):
-                    continue
+    return None
 
-                if candidate not in tracks:
-                    tracks.append(candidate)
 
+def extract_table_items(soup, wanted_column):
+    results = []
+
+    for table in soup.select("table.wikitable"):
+
+        rows = table.select("tr")
+        header_index = None
+        column_index = None
+
+        # Richtige Spalte anhand der Tabellenüberschrift finden.
+        for row_index, row in enumerate(rows):
+
+            cells = row.select("th, td")
+
+            headings = [
+                clean(cell.get_text(" ", strip=True)).lower()
+                for cell in cells
+            ]
+
+            for index, heading in enumerate(headings):
+                if heading.rstrip(":") == wanted_column.lower():
+                    header_index = row_index
+                    column_index = index
+                    break
+
+            if header_index is not None:
                 break
 
-    return tracks
+        if header_index is None:
+            continue
+
+        # Nur die tatsächliche Track- bzw. Arena-Spalte lesen.
+        for row in rows[header_index + 1:]:
+
+            cells = row.select("th, td")
+
+            if len(cells) <= column_index:
+                continue
+
+            value = clean(
+                cells[column_index].get_text(" ", strip=True)
+            )
+
+            if not value:
+                continue
+
+            if value.lower() in {
+                "track",
+                "arena",
+                "version",
+                "author",
+                "music",
+                "cup",
+                "stages"
+            }:
+                continue
+
+            if value not in results:
+                results.append(value)
+
+    return results
+
+
+def extract_pack_page(title, url):
+    print("Lese:", title)
+
+    html = wiki_parse(title)
+    soup = BeautifulSoup(html, "html.parser")
+
+    tracks = extract_table_items(soup, "Track")
+    arenas = extract_table_items(soup, "Arena")
+
+    declared_tracks = get_declared_count(soup, "Tracks")
+    declared_arenas = get_declared_count(soup, "Arenas")
+
+    return {
+        "name": title,
+        "url": url,
+        "declared_tracks": declared_tracks,
+        "declared_arenas": declared_arenas,
+        "tracks": tracks,
+        "arenas": arenas,
+        "track_count_extracted": len(tracks),
+        "arena_count_extracted": len(arenas),
+        "status": (
+            "candidate"
+            if tracks or arenas
+            else "needs_manual_review"
+        )
+    }
 
 
 def main():
-    print("Starte HNS-Pack-Suche ...")
+    print("================================")
+    print("MKWII HNS CATALOGUE VERSION 2")
+    print("================================")
 
-    try:
-        pack_links = extract_pack_links()
-    except Exception as error:
-        raise SystemExit(
-            "Fehler beim Laden der HNS-Pack-Übersicht: "
-            + str(error)
-        )
+    pack_links = extract_pack_links()
 
-    print("Gefundene mögliche HNS-Packs:", len(pack_links))
+    print("Gefundene Pack-Seiten:", len(pack_links))
 
     catalogue = {
         "source": INDEX,
@@ -202,51 +274,64 @@ def main():
             "%Y-%m-%dT%H:%M:%SZ",
             time.gmtime()
         ),
-        "matching_note": (
-            "Erste automatische Sammlung. "
-            "Streckennamen müssen bei Bedarf manuell überprüft werden."
-        ),
+        "version": 2,
         "packs": []
     }
 
     report = []
+    errors = 0
 
     for name, url in sorted(
         pack_links.items(),
         key=lambda item: item[0].lower()
     ):
-        print("Lese Pack:", name)
 
         try:
-            title = unquote(
+            page_title = unquote(
                 url.split("/wiki/", 1)[1]
             ).replace("_", " ")
 
-            html = get_page_html(title)
-            tracks = extract_tracks(html)
+            pack = extract_pack_page(page_title, url)
 
-            catalogue["packs"].append({
-                "name": name,
-                "url": url,
-                "tracks": tracks,
-                "track_count_extracted": len(tracks),
-                "status": (
-                    "candidate"
-                    if tracks
-                    else "needs_manual_review"
-                )
-            })
+            catalogue["packs"].append(pack)
+
+            track_status = ""
+
+            if pack["declared_tracks"] is not None:
+                if pack["track_count_extracted"] != pack["declared_tracks"]:
+                    track_status = (
+                        " | ABWEICHUNG: erwartet "
+                        + str(pack["declared_tracks"])
+                    )
+
+            arena_status = ""
+
+            if pack["declared_arenas"] is not None:
+                if pack["arena_count_extracted"] != pack["declared_arenas"]:
+                    arena_status = (
+                        " | Arenen erwartet "
+                        + str(pack["declared_arenas"])
+                    )
 
             report.append(
-                f"{name}: {len(tracks)} Strecken gefunden"
+                f"{name}: "
+                f"{pack['track_count_extracted']} Strecken"
+                f"{track_status} | "
+                f"{pack['arena_count_extracted']} Arenen"
+                f"{arena_status} | "
+                f"{pack['status']}"
             )
 
         except Exception as error:
+            errors += 1
+
             catalogue["packs"].append({
                 "name": name,
                 "url": url,
                 "tracks": [],
+                "arenas": [],
                 "track_count_extracted": 0,
+                "arena_count_extracted": 0,
                 "status": "fetch_failed",
                 "error": str(error)[:300]
             })
@@ -255,7 +340,7 @@ def main():
                 f"{name}: FEHLER: {error}"
             )
 
-        time.sleep(0.4)
+        time.sleep(0.35)
 
     OUTPUT.write_text(
         json.dumps(
@@ -267,9 +352,10 @@ def main():
     )
 
     REPORT.write_text(
-        "MKWii HNS PACK-KATALOG\n"
+        "MKWII HNS PACK-KATALOG VERSION 2\n"
         f"Quelle: {INDEX}\n"
-        f"Gefundene Pack-Seiten: {len(pack_links)}\n\n"
+        f"Pack-Seiten: {len(pack_links)}\n"
+        f"Fehler: {errors}\n\n"
         + "\n".join(report)
         + "\n",
         encoding="utf-8"
@@ -277,7 +363,8 @@ def main():
 
     print("--------------------------------")
     print("FERTIG!")
-    print("Gefundene Packs:", len(pack_links))
+    print("Packs:", len(catalogue["packs"]))
+    print("Fehler:", errors)
     print("Datenbank:", OUTPUT)
     print("Bericht:", REPORT)
     print("--------------------------------")
